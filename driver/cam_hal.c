@@ -273,8 +273,8 @@ void IRAM_ATTR ll_cam_send_event(cam_obj_t *cam, cam_event_t cam_event,
 
 // Copy fram from DMA dma_buffer to fram dma_buffer
 static void cam_task(void *arg) {
-  int cnt = 0;
-  int frame_pos = 0;
+  int cnt = 0;       // Tracks the number of DMA transfers
+  int frame_pos = 0; // Output Frame Queue index
   cam_obj->state = CAM_STATE_IDLE;
   cam_event_t cam_event = 0;
 
@@ -303,6 +303,8 @@ static void cam_task(void *arg) {
           (cam_obj->dma_bytes_per_item * cam_obj->in_bytes_per_pixel);
 
       if (cam_event == CAM_IN_SUC_EOF_EVENT) {
+        ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: CAM_IN_SUC_EOF_EVENT\r\n"));
+
         if (!cam_obj->psram_mode) {
           if (cam_obj->fb_size < (frame_buffer_event->len + pixels_per_dma)) {
             ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FB-OVF\r\n"));
@@ -379,9 +381,13 @@ static void cam_task(void *arg) {
         cnt++;
 
       } else if (cam_event == CAM_VSYNC_EVENT) {
+        ESP_CAMERA_ETS_PRINTF(DRAM_STR(
+            "cam_hal: CAM_VSYNC_EVENT: New frame capture started\r\n"));
         // DBG_PIN_SET(1);
         ll_cam_stop(cam_obj);
 
+        // --- Start constructing the last received framebuffer ---
+        // Handle JPEG mode
         if (cnt || !cam_obj->jpeg_mode || cam_obj->psram_mode) {
           if (cam_obj->jpeg_mode) {
             if (!cam_obj->psram_mode) {
@@ -400,15 +406,21 @@ static void cam_task(void *arg) {
             cnt++;
           }
 
+          // Mark frame as processed
           cam_obj->frames[frame_pos].en = 0;
 
+          // Handle PSRAM / DMA mode
           if (cam_obj->psram_mode) {
             if (cam_obj->jpeg_mode) {
+              // In JPEG mode received frame buffer has DMA CNT * DMA size
               frame_buffer_event->len = cnt * cam_obj->dma_half_buffer_size;
             } else {
+              // Else its just the expected object size
               frame_buffer_event->len = cam_obj->recv_size;
             }
           } else if (!cam_obj->jpeg_mode) {
+            // If the current framebuffer len is not what we expect, throw
+            // current frame in the bin
             if (frame_buffer_event->len != cam_obj->fb_size) {
               cam_obj->frames[frame_pos].en = 1;
               ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FB-SIZE: %u != %u\r\n"),
@@ -416,29 +428,30 @@ static void cam_task(void *arg) {
                                     (unsigned)cam_obj->fb_size);
             }
           }
-          // send frame
-          if (!cam_obj->frames[frame_pos].en &&
-              xQueueSend(cam_obj->frame_buffer_queue,
-                         (void *)&frame_buffer_event, 0) != pdTRUE) {
-            // pop frame buffer from the queue
-            camera_fb_t *fb2 = NULL;
-            if (xQueueReceive(cam_obj->frame_buffer_queue, &fb2, 0) == pdTRUE) {
-              // push the new frame to the end of the queue
-              if (xQueueSend(cam_obj->frame_buffer_queue,
-                             (void *)&frame_buffer_event, 0) != pdTRUE) {
-                cam_obj->frames[frame_pos].en = 1;
-                ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FBQ-SND\r\n"));
-              }
-              // free the popped buffer
-              cam_give(fb2);
-            } else {
-              // queue is full and we could not pop a frame from it
+
+          // --- Enqueue freshly constructed framebuffer ---
+          // Check if the current frame slot is disabled, only happens in above
+          // condition
+          if (!cam_obj->frames[frame_pos].en) {
+            // Check if we can send the last received frame buffer
+            if (xQueueSend(cam_obj->frame_buffer_queue,
+                           (void *)&frame_buffer_event, 0) != pdTRUE) {
+              ESP_CAMERA_ETS_PRINTF(
+                  DRAM_STR("cam_hal: Consumer Q full, dropping frame\r\n"));
+
+              // Queue full → DROP THIS FRAME
               cam_obj->frames[frame_pos].en = 1;
-              ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FBQ-RCV\r\n"));
+
+              // Stop current capture cleanly
+              ll_cam_stop(cam_obj);
+
+              // Do NOT cam_give() any existing frame
+              // Ownership of queued frames is preserved
             }
           }
         }
 
+        // Attempt to start next frame generation
         if (!cam_start_frame(&frame_pos)) {
           cam_obj->state = CAM_STATE_IDLE;
         } else {
